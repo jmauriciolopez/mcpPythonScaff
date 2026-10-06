@@ -311,12 +311,28 @@ def render_orm(e: Entity, known: "dict[str, Entity] | None" = None) -> str:
     imports = ["from datetime import datetime"]
     if any(f.relation == ONE_TO_ONE for f in e.inverses):
         imports.append("from typing import Optional")
+    if e.m2m or e.inverses:
+        imports.append("from typing import TYPE_CHECKING")
     imports += ["from uuid import UUID",
                 f"from sqlalchemy import {', '.join(sa_imports)}",
                 "from sqlalchemy.orm import Mapped, mapped_column"]
     if e.m2m or e.inverses:
         imports.append("from sqlalchemy.orm import relationship")
-    lines = ["\n".join(imports), "", "from shared.infrastructure.database import Base", ""]
+    lines = ["\n".join(imports), "",
+             "from shared.infrastructure.persistence.database import Base", ""]
+    related_entities = {
+        f.related_entity
+        for f in e.m2m + e.inverses
+        if f.related_entity and f.related_entity != n
+    }
+    if related_entities:
+        lines += ["if TYPE_CHECKING:"]
+        lines += [
+            f"    from infrastructure.database.models.{_rel_snake(name)}_orm "
+            f"import {name}ORM"
+            for name in sorted(related_entities)
+        ]
+        lines.append("")
     for f in e.m2m:
         r = _rel_snake(f.related_entity or "")
         rt = _table_of(f.related_entity or "", known)
@@ -381,6 +397,11 @@ def render_sql_repository(e: Entity, known: "dict[str, Entity] | None" = None) -
         imports += ["from collections.abc import Mapping", "from typing import ClassVar"]
     if targets:
         imports.append("from uuid import UUID")
+    if e.m2m:
+        imports += [
+            "from datetime import UTC, datetime",
+            "from shared.domain.exceptions import EntityNotFoundException",
+        ]
     imports += ["from sqlalchemy.orm import Session",
                 f"from domain.entities.{s} import {n}",
                 f"from domain.repositories.{s}_repository import {n}RepositoryPort"]
@@ -390,8 +411,14 @@ def render_sql_repository(e: Entity, known: "dict[str, Entity] | None" = None) -
                            f"{_rel_snake(R)}_orm import {R}ORM")
     imports += [f"from infrastructure.database.models.{s}_orm import {n}ORM",
                 "from shared.infrastructure.sql_repository import SQLBaseRepository"]
-    lines = ["\n".join(imports), "", "",
-             f"class {n}Repository(SQLBaseRepository[{n}, {n}ORM], {n}RepositoryPort):"]
+    lines = [
+        "\n".join(imports),
+        "",
+        "",
+        f"class {n}Repository(SQLBaseRepository[{n}, {n}ORM], {n}RepositoryPort):",
+        f"    def __init__(self, db: Session) -> None:",
+        f'        super().__init__(db, {n}, {n}ORM, "{e.resource_name}")',
+    ]
     body: list[str] = []
 
     def gap() -> None:
@@ -415,15 +442,58 @@ def render_sql_repository(e: Entity, known: "dict[str, Entity] | None" = None) -
                  "        return [row.id for row in rows]"]
     if e.m2m:
         gap()
+        for f in e.m2m:
+            R = f.related_entity or ""
+            r = _rel_snake(R)
+            body += [
+                f'    def _get_active_{r}s(self, {r}_ids: list[UUID]) -> list["{R}ORM"]:',
+                "        if not " + f"{r}_ids:",
+                "            return []",
+                f"        rows = (self.db.query({R}ORM)",
+                f"                .filter({R}ORM.id.in_({r}_ids),",
+                f"                        {R}ORM.deleted.is_(False))",
+                "                .all())",
+                f"        found_ids = {{row.id for row in rows}}",
+                f"        if found_ids != set({r}_ids):",
+                f"            missing_ids = [item_id for item_id in {r}_ids",
+                "                           if item_id not in found_ids]",
+                "            raise EntityNotFoundException(",
+                f'                f"No existen registros activos de {R} con IDs: '
+                '{missing_ids}."',
+                "            )",
+                "        return rows",
+                "",
+            ]
         body += [f"    def _to_orm(self, entity: {n}) -> {n}ORM:",
                  "        orm_entity = super()._to_orm(entity)"]
         for f in e.m2m:
             R = f.related_entity or ""
-            body += [f"        orm_entity.{f.rel_attr} = (self.db.query({R}ORM)",
-                     f"                             .filter({R}ORM.id.in_(entity.{f.name}),",
-                     f"                                     {R}ORM.deleted.is_(False))",
-                     "                             .all())"]
+            r = _rel_snake(R)
+            body.append(
+                f"        orm_entity.{f.rel_attr} = "
+                f"self._get_active_{r}s(entity.{f.name})"
+            )
         body.append("        return orm_entity")
+        body += [
+            "",
+            f"    def update(self, entity_id: int | UUID, entity: {n}) -> {n}:",
+            "        orm_entity = self._get_active_orm_entity(entity_id)",
+        ]
+        for f in e.scalars:
+            body.append(f"        orm_entity.{f.name} = entity.{f.name}")
+        for f in e.m2m:
+            R = f.related_entity or ""
+            r = _rel_snake(R)
+            body.append(
+                f"        orm_entity.{f.rel_attr} = "
+                f"self._get_active_{r}s(entity.{f.name})"
+            )
+        body += [
+            "        orm_entity.updated_on = datetime.now(UTC)",
+            "        self._commit()",
+            "        self.db.refresh(orm_entity)",
+            "        return self._to_domain(orm_entity)",
+        ]
     if e.m2m or e.inverses:
         gap()
         body += [f"    def _to_domain(self, orm_entity: {n}ORM) -> {n}:",
@@ -452,12 +522,15 @@ def render_schemas(e: Entity) -> str:
     for f in e.scalars:
         t = _PY.get(f.type, "str")
         if f.type == "str" and (f.min_length or f.max_length):
-            kwargs = []
+            kwargs = ["default=None"] if not f.required else []
             if f.min_length:
                 kwargs.append(f"min_length={f.min_length}")
             if f.max_length:
                 kwargs.append(f"max_length={f.max_length}")
-            lines.append(f'    {f.name}: {t} = Field({", ".join(kwargs)})')
+            optional = " | None" if not f.required else ""
+            lines.append(
+                f'    {f.name}: {t}{optional} = Field({", ".join(kwargs)})'
+            )
         else:
             lines.append(f"    {f.name}: {t}" + ("" if f.required else " | None = None"))
     for f in e.m2m:  # los lados inversos son de solo lectura: no entran en Create/Update
@@ -551,7 +624,7 @@ def _payload_parts(e: Entity) -> tuple[list[str], str]:
 
 
 def _helper_order(e: Entity, known: "dict[str, Entity] | None") -> list[str]:
-    """Destinos de FK requeridas, dependencias primero."""
+    """Destinos de FK requeridas y N:M, dependencias primero."""
     order: list[str] = []
     seen: set[str] = set()
 
@@ -566,8 +639,8 @@ def _helper_order(e: Entity, known: "dict[str, Entity] | None") -> list[str]:
                     visit(f.related_entity)
         order.append(name)
 
-    for f in e.fks:
-        if f.required and f.related_entity:
+    for f in e.fks + e.m2m:
+        if (f.is_m2m or f.required) and f.related_entity:
             visit(f.related_entity)
     return order
 
@@ -645,6 +718,27 @@ def render_integration_test(e: Entity, known: "dict[str, Entity] | None" = None)
                   f'    payload["{f.name}"] = "00000000-0000-0000-0000-000000000000"',
                   '    response = client.post(BASE + "/", json=payload)',
                   "    assert response.status_code == 404"]
+    for f in e.m2m:
+        r = _rel_snake(f.related_entity or "")
+        lines += [
+            "",
+            "",
+            f"def test_{s}_{f.name}_persist_on_create_and_update(client: TestClient) -> None:",
+            f"    first_{r}_id = _create_{r}(client)",
+            f"    second_{r}_id = _create_{r}(client)",
+            "    payload = _payload(client)",
+            f'    payload["{f.name}"] = [first_{r}_id]',
+            '    created = client.post(BASE + "/", json=payload)',
+            "    assert created.status_code == 201",
+            f'    assert created.json()["{f.name}"] == [first_{r}_id]',
+            "    updated_payload = dict(payload)",
+            f'    updated_payload["{f.name}"] = [second_{r}_id]',
+            '    updated = client.put(',
+            '        BASE + "/{}".format(created.json()["id"]), json=updated_payload',
+            "    )",
+            "    assert updated.status_code == 200",
+            f'    assert updated.json()["{f.name}"] == [second_{r}_id]',
+        ]
     if e.unique_fields:
         lines += ["", "",
                   f"def test_duplicate_{s}_conflict(client: TestClient) -> None:",

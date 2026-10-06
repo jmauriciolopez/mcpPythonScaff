@@ -170,3 +170,11 @@ Las relaciones que escriben una FK o asociación (`many_to_many`,
 `many_to_one` y el lado dueño de `one_to_one`) requieren que el ORM del destino
 ya exista. Los lados inversos pueden generarse antes; el servidor advertirá si
 aún falta el ORM relacionado.
+
+El repositorio SQL generado inicializa `SQLBaseRepository` con la sesión, la
+entidad de dominio, el ORM y el nombre del recurso. Para relaciones
+`many_to_many`, valida que todos los IDs correspondan a registros activos y
+sincroniza la asociación tanto al crear como al actualizar. Los schemas
+generados conservan como opcionales los campos `str` no requeridos aunque
+tengan restricciones de longitud. Las pruebas de integración generadas
+incluyen la creación y actualización de relaciones N:M.
