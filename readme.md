@@ -117,6 +117,12 @@ destino pueden usar entornos Python diferentes: las dependencias necesarias
 para ejecutar el scaffolding generado deben estar instaladas en el entorno de
 la aplicación.
 
+Los slices generados incluyen `PATCH /{entity_id}` además de `PUT`. El schema
+PATCH acepta campos omitidos y la fábrica combina los campos recibidos con la
+entidad actual antes de delegar la actualización al servicio. Un body vacío se
+trata como una operación sin cambios. Las pruebas de integración generadas
+comprueban que PATCH no sobrescriba los otros campos.
+
 ## Definición inline de entidad
 
 ```json

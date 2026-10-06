@@ -539,6 +539,43 @@ def render_schemas(e: Entity) -> str:
         lines.append("    pass")
     lines += ["", f"class {n}Create({n}Base):", "    pass", "",
               f"class {n}Update({n}Base):", "    pass", "",
+              f"class {n}Patch(BaseModel):"]
+    for f in e.scalars:
+        t = _PY.get(f.type, "str")
+        patch_default = (
+            "None"
+            if not f.required
+            else {
+                "str": '""',
+                "int": "0",
+                "float": "0.0",
+                "bool": "False",
+                "datetime": "datetime.min",
+                "uuid": "UUID(int=0)",
+            }[f.type]
+        )
+        if f.type == "str" and (f.min_length or f.max_length):
+            kwargs = [f"default={patch_default}"]
+            if f.min_length:
+                kwargs.append(f"min_length={f.min_length}")
+            if f.max_length:
+                kwargs.append(f"max_length={f.max_length}")
+            optional = " | None" if not f.required else ""
+            lines.append(
+                f'    {f.name}: {t}{optional} = Field({", ".join(kwargs)})'
+            )
+        else:
+            optional = " | None" if not f.required else ""
+            lines.append(
+                f"    {f.name}: {t}{optional} = Field(default={patch_default})"
+            )
+    for f in e.m2m:
+        lines.append(
+            f"    {f.name}: list[UUID] = Field(default_factory=list)"
+        )
+    if not e.scalars and not e.m2m:
+        lines.append("    pass")
+    lines += ["",
               f"class {n}Response(BaseModel):",
               "    model_config = ConfigDict(from_attributes=True)", "",
               "    id: UUID"]
@@ -564,13 +601,24 @@ def render_controller(e: Entity) -> str:
              f"from domain.entities.{s} import {n}",
              f"from infrastructure.api.dependencies import get_{s}_service",
              f"from infrastructure.api.schemas.{s}_schemas import "
-             f"{n}Create, {n}Response, {n}Update",
+             f"{n}Create, {n}Patch, {n}Response, {n}Update",
              "from shared.infrastructure.generic_controller import create_generic_router", "",
              "",
              f"def update_{s}({s}_id: int | UUID, payload: {n}Update) -> {n}:",
              f"    if not isinstance({s}_id, UUID):",
              f'        raise TypeError("El ID de un {s} debe ser UUID.")',
              f"    return {n}(id={s}_id" + (f", {update_args}" if update_args else "") + ")",
+             "",
+             "",
+             f"def patch_{s}({s}_id: int | UUID, current: {n}, payload: {n}Patch) -> {n}:",
+             f"    if not isinstance({s}_id, UUID):",
+             f'        raise TypeError("El ID de un {s} debe ser UUID.")',
+             f"    provided = payload.model_fields_set",
+             f"    return {n}(id={s}_id" + "".join(
+                 f", {f.name}=payload.{f.name} if \"{f.name}\" in provided "
+                 f"else current.{f.name}"
+                 for f in e.scalars + e.m2m
+             ) + ")",
              "",
              "",
              "router = create_generic_router(",
@@ -580,6 +628,8 @@ def render_controller(e: Entity) -> str:
              + (factory_args if factory_args else "") + "),",
              f"    update_schema={n}Update,",
              f"    update_factory=update_{s},",
+             f"    patch_schema={n}Patch,",
+             f"    patch_factory=patch_{s},",
              f'    resource_name="{e.resource_name}",',
              f"    response_schema={n}Response,",
              "    entity_id_type=UUID,",
@@ -601,6 +651,23 @@ def _val(f: EntityField) -> str:
         return '"2026-01-01T00:00:00Z"'
     if f.type == "uuid":
         return '"11111111-1111-1111-1111-111111111111"'
+    return "None"
+
+
+def _patch_val(f: EntityField) -> str:
+    if f.type == "str":
+        length = max(f.min_length or 1, 1)
+        return f'"{"x" * length}"'
+    if f.type == "int":
+        return "2"
+    if f.type == "float":
+        return "2.0"
+    if f.type == "bool":
+        return "False"
+    if f.type == "datetime":
+        return '"2027-01-01T00:00:00Z"'
+    if f.type == "uuid":
+        return '"22222222-2222-2222-2222-222222222222"'
     return "None"
 
 
@@ -738,6 +805,32 @@ def render_integration_test(e: Entity, known: "dict[str, Entity] | None" = None)
             "    )",
             "    assert updated.status_code == 200",
             f'    assert updated.json()["{f.name}"] == [second_{r}_id]',
+        ]
+    patch_field = next(
+        (f for f in e.scalars if f.required and not f.is_fk),
+        None,
+    )
+    if patch_field is not None:
+        preserved_fields = [
+            f for f in e.scalars if f.name != patch_field.name
+        ]
+        lines += [
+            "",
+            "",
+            f"def test_patch_{s}_preserves_unprovided_fields(client: TestClient) -> None:",
+            "    payload = _payload(client)",
+            '    created = client.post(BASE + "/", json=payload).json()',
+            "    patched = client.patch(",
+            '        BASE + "/{}".format(created["id"]),',
+            f'        json={{"{patch_field.name}": {_patch_val(patch_field)}}},',
+            "    )",
+            "    assert patched.status_code == 200",
+            f'    assert patched.json()["{patch_field.name}"] == '
+            f"{_patch_val(patch_field)}",
+            *[
+                f'    assert patched.json()["{f.name}"] == created["{f.name}"]'
+                for f in preserved_fields
+            ],
         ]
     if e.unique_fields:
         lines += ["", "",

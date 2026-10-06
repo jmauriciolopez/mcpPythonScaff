@@ -6,6 +6,7 @@ from mcp_controller_builder.templates import (
     EntityField,
     render_integration_test,
     render_orm,
+    render_controller,
     render_schemas,
     render_sql_repository,
 )
@@ -111,6 +112,27 @@ class RepositoryTemplateTests(unittest.TestCase):
         self.assertIn('created.json()["role_ids"] == [first_role_id]', source)
         self.assertIn('updated.json()["role_ids"] == [second_role_id]', source)
         compile(source, "test_members_api.py", "exec")
+
+    def test_generated_patch_schema_controller_and_integration_test(self) -> None:
+        schemas = render_schemas(self.member)
+        controller = render_controller(self.member)
+        integration_test = render_integration_test(self.member, self.known)
+
+        self.assertIn(
+            "class MemberPatch(BaseModel):",
+            schemas,
+        )
+        self.assertIn('username: str = Field(default="", min_length=1, max_length=200)', schemas)
+        self.assertIn("phone: str | None = Field(default=None, max_length=30)", schemas)
+        self.assertIn("role_ids: list[UUID] = Field(default_factory=list)", schemas)
+        self.assertIn("def patch_member(", controller)
+        self.assertIn("patch_schema=MemberPatch", controller)
+        self.assertIn("patch_factory=patch_member", controller)
+        self.assertIn("def test_patch_member_preserves_unprovided_fields", integration_test)
+        self.assertIn('json={"username": "x"}', integration_test)
+        compile(schemas, "member_schemas.py", "exec")
+        compile(controller, "member_controller.py", "exec")
+        compile(integration_test, "test_members_api.py", "exec")
 
 
 if __name__ == "__main__":
